@@ -12,18 +12,13 @@
 #define CDC_DEVICE_CNT					1u
 
 /* device tree node */
-#define CDC_OF_COMPATIBLE				"tes,cdc-1.0"
-
-/* Register access macros */
-#define CDC_IO_WREG(addr,data) 			iowrite32(data,addr)
-#define CDC_IO_RREG(addr) 				ioread32(addr)
-#define CDC_IO_RADDR(base,reg)			((void*)((unsigned long)base|((unsigned long)reg)<<2))
+#define CDC_OF_COMPATIBLE				"tes,cdc-2.1"
 
 struct cdc_dev
 {
-	unsigned long base_phys;
-	unsigned long span;
-	void *base_virt;
+	unsigned long base_phys; // fixme: use resource_size_t
+	unsigned long span;// fixme: use resource_size_t
+	void __iomem *mmio;
 	unsigned int irq_no;
 	unsigned int irq_stat;
 	spinlock_t irq_slck;
@@ -32,5 +27,16 @@ struct cdc_dev
 	struct cdev cdev;
 	struct device *device;
 };
+
+/* Register access */
+u32 cdc_read_reg (struct cdc_dev *cdc, u32 reg)
+{
+	return ioread32(cdc->mmio + (reg * 4));
+}
+
+void cdc_write_reg (struct cdc_dev *cdc, u32 reg, u32 val)
+{
+	iowrite32(val, cdc->mmio + (reg * 4));
+}
 
 #endif /* TES_DAVE_MODULE_H_ */

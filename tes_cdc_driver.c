@@ -53,9 +53,7 @@ static long cdc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
     {
       case CDC_IOCTL_REG_WRITE:
         /* direct register write: Register value in argument */
-        CDC_IO_WREG(CDC_IO_RADDR(dev->base_virt,
-              cdc_reg),
-            arg);
+        cdc_write_reg(dev, cdc_reg, arg);
         break;
       case CDC_IOCTL_SET_WORKING_REG:
         if(arg > dev->span)
@@ -75,8 +73,7 @@ static long cdc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
     switch(cmd_nr)
     {
       case CDC_IOCTL_REG_READ:
-        if(!put_user(CDC_IO_RREG(CDC_IO_RADDR(dev->base_virt,
-                  cdc_reg)), (unsigned long*) arg))
+        if(!put_user(cdc_read_reg(dev, cdc_reg), (unsigned long*) arg))
           return -EFAULT;
         break;
       case CDC_IOCTL_NR_SETTINGS:
@@ -133,8 +130,8 @@ static irqreturn_t std_irq_handler(int irq, void *dev_id)
 	struct cdc_dev *cdcd = dev_id;
 	int status;
 
-	status = CDC_IO_RREG(CDC_IO_RADDR(cdcd->base_virt,CDC_REG_GLOBAL_IRQ_STATUS));
-	CDC_IO_WREG(CDC_IO_RADDR(cdcd->base_virt, CDC_REG_GLOBAL_IRQ_CLEAR), status);
+	status = cdc_read_reg(cdcd, CDC_REG_GLOBAL_IRQ_STATUS);
+	cdc_write_reg(cdcd, CDC_REG_GLOBAL_IRQ_CLEAR, status);
 
 	spin_lock_irqsave(&cdcd->irq_slck, flags);
 	cdcd->irq_stat |= status;
@@ -234,10 +231,10 @@ static void cdc_shutdown_device(struct cdc_dev *dev)
  * */
 static int cdc_probe(struct platform_device *pdev)
 {
-	struct device_node *np;
-	struct resource rsrc;
+	struct resource *mem;
 	int result = 0;
 	struct cdc_dev *cdc;
+	int irq;
 
 	cdc = devm_kzalloc(&pdev->dev, sizeof(struct cdc_dev), GFP_KERNEL);
 	if(!cdc)
@@ -246,42 +243,35 @@ static int cdc_probe(struct platform_device *pdev)
 			"Memory allocation for driver struct failed!\n");
 		return -ENOMEM;
 	}
+
 	platform_set_drvdata(pdev, cdc);
+
 	cdc->device = &pdev->dev;
-	np = pdev->dev.of_node;
-	if(!np)
-	{
-		dev_err(&pdev->dev,
-			"driver should only be instanciated over device tree!\n");
-		return -ENODEV;
+
+	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	cdc->mmio = devm_ioremap_resource(&pdev->dev, mem);
+	dev_dbg(&pdev->dev, "Mapped IO from 0x%x to 0x%p\n", mem->start,
+		cdc->mmio);
+	if (IS_ERR(cdc->mmio)) {
+		return PTR_ERR(cdc->mmio);
 	}
 
-	of_address_to_resource(np, 0, &rsrc);
-	cdc->base_phys = rsrc.start;
-	cdc->span = rsrc.end - rsrc.start;
-	cdc->irq_no = of_irq_to_resource(np, 0, &rsrc);
+	cdc->base_phys = mem->start;
+	cdc->span = mem->end - mem->start;
+
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0) {
+		dev_err(&pdev->dev, "Could not get platform IRQ number\n");
+		return irq;
+	}
+	cdc->irq_no = irq;
 
 	cdc_log_params(cdc);
 
 	spin_lock_init(&cdc->irq_slck);
 	init_waitqueue_head(&cdc->irq_waitq);
 
-	if (!request_mem_region(cdc->base_phys, cdc->span, "TES CDC"))
-	{
-		dev_err(&pdev->dev, "memory region already in use\n");
-		return -EBUSY;
-	}
-
-	cdc->base_virt = ioremap_nocache(cdc->base_phys, cdc->span);
-	if (!cdc->base_virt)
-	{
-		dev_err(&pdev->dev, "ioremap failed\n");
-		result = -EBUSY;
-		goto IO_FAILED;
-	}
-
-	result = CDC_IO_RREG(CDC_IO_RADDR(cdc->base_virt,
-				CDC_REG_GLOBAL_HW_REVISION));
+	result = cdc_read_reg(cdc, CDC_REG_GLOBAL_HW_REVISION);
 	if(result < 1)
 	{
 		dev_warn(&pdev->dev,
@@ -293,8 +283,7 @@ static int cdc_probe(struct platform_device *pdev)
 		dev_info(&pdev->dev, "Found CDC rev. 0x%08X\n", result);
 	}
 
-	result = CDC_IO_RREG(CDC_IO_RADDR(cdc->base_virt,
-				CDC_REG_GLOBAL_LAYER_COUNT));
+	result = cdc_read_reg(cdc, CDC_REG_GLOBAL_LAYER_COUNT);
 	if(result < 1)
 	{
 		dev_warn(&pdev->dev,
@@ -308,7 +297,7 @@ static int cdc_probe(struct platform_device *pdev)
 	result = cdc_setup_device(cdc);
 	if(result)
 	{
-		goto DEV_FAILED;
+		goto error;
 	}
 
 	/* register cdc IRQs */
@@ -316,19 +305,15 @@ static int cdc_probe(struct platform_device *pdev)
 	if(result)
 	{
 		dev_err(&pdev->dev, "can't register irq %d\n", cdc->irq_no);
-		goto IRQ_FAILED;
+		goto error;
 	}
 
 	dev_warn(&pdev->dev, "This driver is PRELIMINARY. Do NOT use in production environment!\n");
 
 	return 0;
 
-IRQ_FAILED:
+error:
 	cdc_shutdown_device(cdc);
-DEV_FAILED:
-	iounmap(cdc->base_virt);
-IO_FAILED:
-	release_mem_region(cdc->base_phys, cdc->span);
 
 	return -EBUSY;
 }
@@ -337,8 +322,6 @@ static int cdc_remove(struct platform_device *pdev)
 {
 	struct cdc_dev *cdc = platform_get_drvdata(pdev);
 	unregister_irq(cdc);
-	iounmap(cdc->base_virt);
-	release_mem_region(cdc->base_phys, cdc->span);
 	cdc_shutdown_device(cdc);
 	devm_kfree(&pdev->dev, cdc);
 	return 0;
